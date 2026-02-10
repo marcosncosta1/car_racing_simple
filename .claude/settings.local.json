@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:nathanbaileyw.medium.com)",
+      "WebFetch(domain:gymnasium.farama.org)",
+      "Bash(pip install:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(conda install:*)",
+      "Bash(brew install:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

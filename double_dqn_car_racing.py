@@ -241,7 +241,9 @@ class DQNAgent:
 
         # Target Q values: r + gamma * max_a' Q_target(s', a')
         with torch.no_grad():
-            next_q = self.target_net(next_states_t).max(dim=1)[0]
+            best_actions = self.q_net(next_states_t).argmax(dim=1) # best action from Q-network Double DQN
+            next_q = self.target_net(next_states_t).gather(1, best_actions.unsqueeze(1)).squeeze(1) # best action from target network Double DQN
+
             target = rewards_t + GAMMA * next_q * (1 - dones_t)
 
         # Loss: MSE between predicted and target Q-values

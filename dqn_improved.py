@@ -1,9 +1,24 @@
 """
-DQN for CarRacing-v3 (Discrete)
-================================
-A simple, from-scratch Deep Q-Network to learn CarRacing.
-Based on the DQN approach from Nathan Bailey's Flappy Bird tutorial,
-adapted for the CarRacing-v3 environment with discrete actions.
+Dueling Double DQN for CarRacing-v3 (Discrete)
+================================================
+An improved Deep Q-Network combining three key advances over vanilla DQN:
+
+1. DUELING ARCHITECTURE — Splits the Q-network head into Value V(s) and
+   Advantage A(s,a) streams. Most states have similar value regardless of
+   action; the advantage stream learns *which action is better* more
+   efficiently. Q(s,a) = V(s) + A(s,a) - mean(A).
+
+2. DOUBLE DQN — Decouples action selection from action evaluation in the
+   target computation. The q_net picks the best action, the target_net
+   evaluates it. This reduces Q-value overestimation that hurts vanilla DQN.
+
+3. HUBER LOSS (SmoothL1) — More robust to large TD errors than MSE.
+   Prevents exploding gradients from outlier transitions.
+
+Network improvements over vanilla DQN:
+  - Wider CNN (128 filters in last conv layer)
+  - BatchNorm after each conv layer (stabilizes training)
+  - Deeper FC head with dropout (512 → 256 → dual streams)
 
 Actions (5 discrete):
   0 = do nothing
@@ -42,16 +57,16 @@ IMAGE_SIZE = 84           # resize frames to IMAGE_SIZE x IMAGE_SIZE
 # --- Exploration ---
 EPSILON_START = 1.0       # initial exploration rate (100% random)
 EPSILON_END = 0.05        # minimum exploration rate
-EPSILON_DECAY = 50_000    # steps over which epsilon decays linearly
+EPSILON_DECAY = 75_000    # steps over which epsilon decays linearly (longer for better exploration)
 
 # --- Learning ---
 LEARNING_RATE = 1e-4      # Adam optimizer learning rate
 GAMMA = 0.99              # discount factor (how much to value future rewards)
-BATCH_SIZE = 32           # minibatch size for training
+BATCH_SIZE = 64           # minibatch size for training (larger for stability)
 TARGET_UPDATE = 1000      # update target network every N steps
 
 # --- Replay Buffer ---
-BUFFER_SIZE = 50_000      # max transitions stored (keep small for fast experiments)
+BUFFER_SIZE = 100_000     # max transitions stored (larger for more diverse experience)
 MIN_BUFFER = 1_000        # minimum transitions before training starts
 
 # --- Training ---
@@ -134,16 +149,18 @@ class ReplayBuffer:
 
 
 # ============================================================
-# DQN NETWORK
+# DUELING DQN NETWORK
 # ============================================================
 
-class DQN(nn.Module):
+class DuelingDQN(nn.Module):
     """
-    CNN-based Q-network.
+    Dueling CNN-based Q-network.
 
-    Architecture (tune layer sizes and count!):
-      Conv2D layers extract spatial features from stacked frames.
-      Fully connected layers map features to Q-values for each action.
+    Architecture improvements over vanilla DQN:
+      1. Wider CNN: last conv layer uses 128 filters (vs 64)
+      2. BatchNorm after each conv layer for training stability
+      3. Dueling head: separate Value and Advantage streams
+         Q(s,a) = V(s) + A(s,a) - mean(A)
 
     Input shape:  (batch, FRAME_STACK, IMAGE_SIZE, IMAGE_SIZE)
     Output shape: (batch, 5)  — one Q-value per discrete action
@@ -152,24 +169,41 @@ class DQN(nn.Module):
     def __init__(self, n_actions=5):
         super().__init__()
 
-        # --- CNN feature extractor ---
+        # --- CNN feature extractor (wider + BatchNorm) ---
         self.conv = nn.Sequential(
             nn.Conv2d(FRAME_STACK, 32, kernel_size=8, stride=4),  # 84 -> 20
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),           # 20 -> 9
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),           # 9 -> 7
+            nn.Conv2d(64, 128, kernel_size=3, stride=1),          # 9 -> 7 (wider: 128 filters)
+            nn.BatchNorm2d(128),
             nn.ReLU(),
         )
 
         # Calculate flattened size after convolutions
         self._conv_out_size = self._get_conv_out_size()
 
-        # --- Fully connected head ---
-        self.fc = nn.Sequential(
+        # --- Shared feature layer ---
+        self.fc_shared = nn.Sequential(
             nn.Linear(self._conv_out_size, 512),
             nn.ReLU(),
-            nn.Linear(512, n_actions),
+            nn.Dropout(0.1),
+        )
+
+        # --- Value stream: V(s) — how good is this state? ---
+        self.value_stream = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+        )
+
+        # --- Advantage stream: A(s,a) — how much better is each action? ---
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, n_actions),
         )
 
     def _get_conv_out_size(self):
@@ -180,7 +214,15 @@ class DQN(nn.Module):
     def forward(self, x):
         x = self.conv(x)
         x = x.view(x.size(0), -1)
-        return self.fc(x)
+        x = self.fc_shared(x)
+
+        value = self.value_stream(x)           # (batch, 1)
+        advantage = self.advantage_stream(x)   # (batch, n_actions)
+
+        # Combine: Q(s,a) = V(s) + A(s,a) - mean(A)
+        # Subtracting mean(A) ensures identifiability (V and A are unique)
+        q_values = value + advantage - advantage.mean(dim=1, keepdim=True)
+        return q_values
 
 
 # ============================================================
@@ -188,15 +230,15 @@ class DQN(nn.Module):
 # ============================================================
 
 class DQNAgent:
-    """DQN Agent with epsilon-greedy exploration and target network."""
+    """Dueling Double DQN Agent with epsilon-greedy exploration and target network."""
 
     def __init__(self, n_actions=5):
         self.n_actions = n_actions
         self.step_count = 0
 
-        # Q-network and target network
-        self.q_net = DQN(n_actions).to(DEVICE)
-        self.target_net = DQN(n_actions).to(DEVICE)
+        # Q-network and target network (both Dueling architecture)
+        self.q_net = DuelingDQN(n_actions).to(DEVICE)
+        self.target_net = DuelingDQN(n_actions).to(DEVICE)
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.target_net.eval()
 
@@ -219,11 +261,13 @@ class DQNAgent:
         else:
             with torch.no_grad():
                 state_t = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
+                self.q_net.eval()
                 q_values = self.q_net(state_t)
+                self.q_net.train()
                 return q_values.argmax(dim=1).item()
 
     def train_step(self):
-        """Sample a batch and perform one gradient step."""
+        """Sample a batch and perform one gradient step (Double DQN + Huber loss)."""
         if len(self.buffer) < MIN_BUFFER:
             return None
 
@@ -239,19 +283,27 @@ class DQNAgent:
         # Current Q values: Q(s, a)
         q_values = self.q_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
 
-        # Target Q values: r + gamma * max_a' Q_target(s', a')
+        # === DOUBLE DQN target ===
+        # q_net selects the best action, target_net evaluates it
+        # This reduces Q-value overestimation from vanilla DQN
         with torch.no_grad():
-            next_q = self.target_net(next_states_t).max(dim=1)[0]
+            self.q_net.eval()
+            best_actions = self.q_net(next_states_t).argmax(dim=1)  # q_net picks action
+            self.q_net.train()
+            next_q = self.target_net(next_states_t).gather(            # target_net evaluates
+                1, best_actions.unsqueeze(1)
+            ).squeeze(1)
             target = rewards_t + GAMMA * next_q * (1 - dones_t)
 
-        # Loss: MSE between predicted and target Q-values
-        loss = nn.MSELoss()(q_values, target)
+        # === HUBER LOSS (SmoothL1) ===
+        # More robust than MSE — clips gradient for large TD errors
+        loss = nn.SmoothL1Loss()(q_values, target)
 
         # Gradient step
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping (stabilizes training)
-        nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=10.0)
+        # Tighter gradient clipping (works well with BatchNorm)
+        nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         # Update target network periodically
@@ -287,16 +339,16 @@ def train():
     agent = DQNAgent(n_actions=5)
     frame_stack = FrameStack()
 
-    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs("checkpoints_improved", exist_ok=True)
 
     # Tracking
     all_rewards = []
     best_avg = -float("inf")
 
-    # Metrics log — saved to metrics.json after training
+    # Metrics log — saved to metrics_improved.json after training
     metrics = {
         "config": {
-            "algorithm": "DQN",
+            "algorithm": "Dueling Double DQN",
             "frame_skip": FRAME_SKIP,
             "frame_stack": FRAME_STACK,
             "image_size": IMAGE_SIZE,
@@ -312,12 +364,15 @@ def train():
             "max_steps": MAX_STEPS,
             "negative_reward_patience": NEGATIVE_REWARD_PATIENCE,
             "device": str(DEVICE),
+            "loss": "Huber (SmoothL1)",
+            "gradient_clip": 1.0,
+            "network": "DuelingDQN (BatchNorm, 128-filter CNN, Dropout 0.1)",
         },
         "episodes": [],
     }
 
     print("\n" + "=" * 60)
-    print("TRAINING CONFIG")
+    print("TRAINING CONFIG — Dueling Double DQN")
     print("=" * 60)
     print(f"  FRAME_SKIP:    {FRAME_SKIP}")
     print(f"  FRAME_STACK:   {FRAME_STACK}")
@@ -329,6 +384,9 @@ def train():
     print(f"  BUFFER_SIZE:   {BUFFER_SIZE}")
     print(f"  TARGET_UPDATE: {TARGET_UPDATE}")
     print(f"  MAX_EPISODES:  {MAX_EPISODES}")
+    print(f"  LOSS:          Huber (SmoothL1)")
+    print(f"  GRAD_CLIP:     1.0")
+    print(f"  NETWORK:       DuelingDQN (BatchNorm, 128 filters, Dropout)")
     print(f"  DEVICE:        {DEVICE}")
     print("=" * 60 + "\n")
 
@@ -414,20 +472,20 @@ def train():
         # Save best model
         if avg_reward > best_avg and episode >= 20:
             best_avg = avg_reward
-            agent.save("checkpoints/best_model.pth")
+            agent.save("checkpoints_improved/best_model.pth")
             print(f"  >>> New best average reward: {best_avg:.1f}")
 
         # Periodic save
         if episode % SAVE_EVERY == 0:
-            agent.save(f"checkpoints/model_ep{episode}.pth")
+            agent.save(f"checkpoints_improved/model_ep{episode}.pth")
 
         # Save metrics periodically (every 10 episodes) so data is available during training
         if episode % 10 == 0:
-            with open("metrics.json", "w") as f:
+            with open("metrics_improved.json", "w") as f:
                 json.dump(metrics, f, indent=2)
 
     # Final saves
-    agent.save("checkpoints/final_model.pth")
+    agent.save("checkpoints_improved/final_model.pth")
     metrics["summary"] = {
         "best_avg_reward_20": float(best_avg),
         "final_reward": float(all_rewards[-1]),
@@ -437,13 +495,13 @@ def train():
         "max_reward": float(max(all_rewards)),
         "min_reward": float(min(all_rewards)),
     }
-    with open("metrics.json", "w") as f:
+    with open("metrics_improved.json", "w") as f:
         json.dump(metrics, f, indent=2)
     env.close()
 
     print("\n" + "=" * 60)
     print(f"Training complete! Best avg(20) reward: {best_avg:.1f}")
-    print(f"Metrics saved to metrics.json")
+    print(f"Metrics saved to metrics_improved.json")
     print("=" * 60)
 
     return all_rewards
@@ -453,11 +511,12 @@ def train():
 # EVALUATION (watch trained agent play)
 # ============================================================
 
-def evaluate(model_path="checkpoints/best_model.pth", episodes=5):
+def evaluate(model_path="checkpoints_improved/best_model.pth", episodes=5):
     """Load a trained model and watch it play."""
     env = gym.make("CarRacing-v3", continuous=False, render_mode="human")
     agent = DQNAgent(n_actions=5)
     agent.load(model_path)
+    agent.q_net.eval()
     frame_stack = FrameStack()
 
     for ep in range(1, episodes + 1):
@@ -490,24 +549,25 @@ def evaluate(model_path="checkpoints/best_model.pth", episodes=5):
 # RECORD (save .mp4 videos of trained agent)
 # ============================================================
 
-def record(model_path="checkpoints/best_model.pth", episodes=3):
+def record(model_path="checkpoints_improved/best_model.pth", episodes=3):
     """Load a trained model and record gameplay as .mp4 videos."""
-    os.makedirs("recordings", exist_ok=True)
+    os.makedirs("recordings_improved", exist_ok=True)
 
     env = gym.make("CarRacing-v3", continuous=False, render_mode="rgb_array")
     env = gym.wrappers.RecordVideo(
         env,
-        video_folder="recordings",
-        name_prefix="car_racing",
+        video_folder="recordings_improved",
+        name_prefix="car_racing_improved",
         episode_trigger=lambda ep: True,  # record every episode
     )
 
     agent = DQNAgent(n_actions=5)
     agent.load(model_path)
+    agent.q_net.eval()
     frame_stack = FrameStack()
 
     print(f"\nRecording {episodes} episodes using model: {model_path}")
-    print(f"Videos will be saved to recordings/\n")
+    print(f"Videos will be saved to recordings_improved/\n")
 
     for ep in range(1, episodes + 1):
         obs, _ = env.reset()
@@ -533,14 +593,14 @@ def record(model_path="checkpoints/best_model.pth", episodes=3):
         print(f"Recorded Episode {ep}: Reward = {total_reward:.1f}")
 
     env.close()
-    print(f"\nDone! Videos saved in recordings/")
+    print(f"\nDone! Videos saved in recordings_improved/")
 
 
 # ============================================================
-# PLOT (generate comparison-ready charts from metrics.json)
+# PLOT (generate comparison-ready charts from metrics_improved.json)
 # ============================================================
 
-def plot(metrics_path="metrics.json"):
+def plot(metrics_path="metrics_improved.json"):
     """Generate training charts from saved metrics for hackathon comparison."""
     import matplotlib.pyplot as plt
 
@@ -560,10 +620,13 @@ def plot(metrics_path="metrics.json"):
     steps = [d["steps"] for d in episodes_data]
     action_dists = [d["action_distribution"] for d in episodes_data]
 
-    os.makedirs("plots", exist_ok=True)
+    os.makedirs("plots_improved", exist_ok=True)
 
     # --- Config text box (shown on reward curve) ---
+    algo = config.get("algorithm", "DQN")
     config_text = (
+        f"{algo}  |  Loss={config.get('loss', 'MSE')}  "
+        f"Grad clip={config.get('gradient_clip', '?')}\n"
         f"LR={config['learning_rate']}  \u03b3={config['gamma']}  "
         f"Batch={config['batch_size']}\n"
         f"Buffer={config['buffer_size']}  "
@@ -586,15 +649,15 @@ def plot(metrics_path="metrics.json"):
                     linestyle=":", alpha=0.7, label=f"Best avg(20): {summary.get('best_avg_reward_20', 0):.1f}")
     ax.set_xlabel("Episode")
     ax.set_ylabel("Reward")
-    ax.set_title("DQN CarRacing-v3 — Reward vs Episode")
+    ax.set_title(f"{algo} CarRacing-v3 — Reward vs Episode")
     ax.legend(loc="lower right")
     ax.text(0.02, 0.98, config_text, transform=ax.transAxes, fontsize=8,
             verticalalignment="top", fontfamily="monospace",
             bbox=dict(boxstyle="round,pad=0.4", facecolor="wheat", alpha=0.8))
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig("plots/reward_curve.png", dpi=150)
-    print("Saved plots/reward_curve.png")
+    fig.savefig("plots_improved/reward_curve.png", dpi=150)
+    print("Saved plots_improved/reward_curve.png")
 
     # --- Figure 2: Training dashboard (4 subplots) ---
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -613,7 +676,7 @@ def plot(metrics_path="metrics.json"):
             ax.legend()
     ax.set_xlabel("Episode")
     ax.set_ylabel("Avg Loss")
-    ax.set_title("Training Loss")
+    ax.set_title("Training Loss (Huber)")
     ax.grid(True, alpha=0.3)
 
     # 2b: Epsilon decay
@@ -654,16 +717,16 @@ def plot(metrics_path="metrics.json"):
     ax.set_ylim(0, 100)
     ax.grid(True, alpha=0.3)
 
-    fig.suptitle(f"DQN Training Dashboard — {config['max_episodes']} episodes\n{config_text}",
+    fig.suptitle(f"{algo} Training Dashboard — {config['max_episodes']} episodes\n{config_text}",
                  fontsize=12, y=1.04, fontfamily="monospace")
     fig.tight_layout()
-    fig.savefig("plots/training_dashboard.png", dpi=150)
-    print("Saved plots/training_dashboard.png")
+    fig.savefig("plots_improved/training_dashboard.png", dpi=150)
+    print("Saved plots_improved/training_dashboard.png")
 
     # --- Print summary table ---
     if summary:
         print("\n" + "=" * 50)
-        print("TRAINING SUMMARY")
+        print(f"TRAINING SUMMARY — {algo}")
         print("=" * 50)
         print(f"  Best avg(20) reward:  {summary.get('best_avg_reward_20', 'N/A'):.1f}")
         print(f"  Final avg(100) reward:{summary.get('final_avg_reward_100', 'N/A'):>7.1f}")
@@ -684,15 +747,15 @@ def plot(metrics_path="metrics.json"):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "eval":
-        model = sys.argv[2] if len(sys.argv) > 2 else "checkpoints/best_model.pth"
+        model = sys.argv[2] if len(sys.argv) > 2 else "checkpoints_improved/best_model.pth"
         n = int(sys.argv[3]) if len(sys.argv) > 3 else 5
         evaluate(model, n)
     elif len(sys.argv) > 1 and sys.argv[1] == "record":
-        model = sys.argv[2] if len(sys.argv) > 2 else "checkpoints/best_model.pth"
+        model = sys.argv[2] if len(sys.argv) > 2 else "checkpoints_improved/best_model.pth"
         n = int(sys.argv[3]) if len(sys.argv) > 3 else 3
         record(model, n)
     elif len(sys.argv) > 1 and sys.argv[1] == "plot":
-        path = sys.argv[2] if len(sys.argv) > 2 else "metrics.json"
+        path = sys.argv[2] if len(sys.argv) > 2 else "metrics_improved.json"
         plot(path)
     else:
         train()
